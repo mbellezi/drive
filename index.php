@@ -19,6 +19,7 @@ const TEMP_DIR = DATA_DIR . DIRECTORY_SEPARATOR . '_tmp';
 const DB_FILE = __DIR__ . DIRECTORY_SEPARATOR . 'envios.sqlite';
 const MAX_BYTES = 3221225472; // 3 GiB
 const MAX_BYTES_LABEL = '3 GB';
+const CHUNK_BYTES = 8388608; // 8 MiB
 const ALLOWED_VIDEO_EXTENSIONS = ['mp4', 'mov', 'avi', 'mkv', 'webm', 'm4v', 'mpeg', 'mpg', '3gp', 'ogv'];
 
 if (!is_dir(DATA_DIR)) {
@@ -31,11 +32,13 @@ if (!is_dir(TEMP_DIR)) {
 // Proteção das pastas de upload: impede listagem e bloqueia acesso/execução de scripts.
 // Em hospedagem cPanel/Apache, estes arquivos .htaccess serão criados automaticamente.
 $dataHtaccess = DATA_DIR . DIRECTORY_SEPARATOR . '.htaccess';
-if (!is_file($dataHtaccess)) {
-    file_put_contents($dataHtaccess, <<<'HTACCESS'
+ensure_security_file($dataHtaccess, <<<'HTACCESS'
 Options -Indexes
 
-<FilesMatch "\.(php|php[0-9]|phtml|phar|cgi|pl|py|sh|asp|aspx|jsp)$">
+RemoveHandler .php .php3 .php4 .php5 .php7 .php8 .phtml .phar .cgi .pl .py .sh .asp .aspx .jsp
+RemoveType .php .php3 .php4 .php5 .php7 .php8 .phtml .phar .cgi .pl .py .sh .asp .aspx .jsp
+
+<FilesMatch "(^|\.)(php|php[0-9]|phtml|phar|cgi|pl|py|sh|asp|aspx|jsp)(\.|$)">
     Require all denied
 </FilesMatch>
 
@@ -43,15 +46,12 @@ Options -Indexes
     Header set X-Content-Type-Options "nosniff"
 </IfModule>
 HTACCESS);
-}
 
 $tmpHtaccess = TEMP_DIR . DIRECTORY_SEPARATOR . '.htaccess';
-if (!is_file($tmpHtaccess)) {
-    file_put_contents($tmpHtaccess, <<<'HTACCESS'
+ensure_security_file($tmpHtaccess, <<<'HTACCESS'
 Options -Indexes
 Require all denied
 HTACCESS);
-}
 
 $pdo = new PDO('sqlite:' . DB_FILE);
 $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -79,11 +79,26 @@ function json_response(array $data, int $status = 200): never
     exit;
 }
 
+function ensure_security_file(string $path, string $content): void
+{
+    if (!is_file($path) || file_get_contents($path) !== $content) {
+        file_put_contents($path, $content);
+    }
+}
+
 function sanitize_filename(string $filename): string
 {
     $filename = preg_replace('/[^a-zA-Z0-9._-]+/', '_', $filename);
     $filename = trim($filename, '._-');
     return $filename !== '' ? $filename : 'video';
+}
+
+function sanitize_stored_basename(string $filename): string
+{
+    $base = pathinfo($filename, PATHINFO_FILENAME);
+    $base = preg_replace('/[^a-zA-Z0-9_-]+/', '_', $base);
+    $base = trim($base, '_-');
+    return $base !== '' ? $base : 'video';
 }
 
 function get_file_extension(string $filename): string
@@ -99,6 +114,15 @@ function is_allowed_video_extension(string $extension): bool
 function allowed_video_extensions_label(): string
 {
     return implode(', ', ALLOWED_VIDEO_EXTENSIONS);
+}
+
+function temp_upload_size(string $tmpUploadDir): int
+{
+    $size = 0;
+    foreach (glob($tmpUploadDir . DIRECTORY_SEPARATOR . '*.part') ?: [] as $part) {
+        $size += filesize($part) ?: 0;
+    }
+    return $size;
 }
 
 function require_admin(): void
@@ -153,6 +177,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
     if (!isset($_FILES['chunk']) || $_FILES['chunk']['error'] !== UPLOAD_ERR_OK) {
         json_response(['ok' => false, 'message' => 'Falha ao receber parte do arquivo.'], 400);
     }
+    if ((int)$_FILES['chunk']['size'] <= 0 || (int)$_FILES['chunk']['size'] > CHUNK_BYTES) {
+        json_response(['ok' => false, 'message' => 'Parte do arquivo com tamanho inválido.'], 422);
+    }
 
     $tmpUploadDir = TEMP_DIR . DIRECTORY_SEPARATOR . $uploadId;
     if (!is_dir($tmpUploadDir)) {
@@ -162,6 +189,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
     $chunkPath = $tmpUploadDir . DIRECTORY_SEPARATOR . str_pad((string)$chunkIndex, 8, '0', STR_PAD_LEFT) . '.part';
     if (!move_uploaded_file($_FILES['chunk']['tmp_name'], $chunkPath)) {
         json_response(['ok' => false, 'message' => 'Não foi possível salvar a parte enviada.'], 500);
+    }
+    $receivedSize = temp_upload_size($tmpUploadDir);
+    if ($receivedSize > $totalSize || $receivedSize > MAX_BYTES) {
+        @unlink($chunkPath);
+        json_response(['ok' => false, 'message' => 'O tamanho recebido ultrapassa o informado.'], 422);
     }
 
     // Ainda faltam partes.
@@ -175,7 +207,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
     }
 
     // Montagem final quando chega a última parte.
-    $safeBase = pathinfo($originalName, PATHINFO_FILENAME);
+    $safeBase = sanitize_stored_basename($originalName);
     $savedName = '';
     $finalPath = '';
 
@@ -767,7 +799,7 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
 <script>
 (() => {
     const MAX_BYTES = <?= MAX_BYTES ?>;
-    const CHUNK_SIZE = 8 * 1024 * 1024; // 8 MB por parte
+    const CHUNK_SIZE = <?= CHUNK_BYTES ?>; // 8 MiB por parte
     const form = document.getElementById('uploadForm');
     const btn = document.getElementById('submitBtn');
     const status = document.getElementById('status');
@@ -872,4 +904,3 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
 <?php endif; ?>
 </body>
 </html>
-
