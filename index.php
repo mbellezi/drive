@@ -59,12 +59,27 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS envios (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     nome TEXT NOT NULL,
     email TEXT NOT NULL,
+    autor TEXT NOT NULL DEFAULT '',
+    co_autor_1 TEXT NOT NULL DEFAULT '',
+    co_autor_2 TEXT NOT NULL DEFAULT '',
     arquivo_original TEXT NOT NULL,
     arquivo_salvo TEXT NOT NULL,
     tamanho INTEGER NOT NULL,
     mime TEXT,
     criado_em TEXT NOT NULL
 )");
+
+$columns = $pdo->query("PRAGMA table_info(envios)")->fetchAll(PDO::FETCH_ASSOC);
+$columnNames = array_column($columns, 'name');
+foreach ([
+    'autor' => "ALTER TABLE envios ADD COLUMN autor TEXT NOT NULL DEFAULT ''",
+    'co_autor_1' => "ALTER TABLE envios ADD COLUMN co_autor_1 TEXT NOT NULL DEFAULT ''",
+    'co_autor_2' => "ALTER TABLE envios ADD COLUMN co_autor_2 TEXT NOT NULL DEFAULT ''",
+] as $columnName => $alterSql) {
+    if (!in_array($columnName, $columnNames, true)) {
+        $pdo->exec($alterSql);
+    }
+}
 
 function h(string $value): string
 {
@@ -145,10 +160,18 @@ function bytes_to_human(int $bytes): string
     return number_format($size, $i === 0 ? 0 : 2, ',', '.') . ' ' . $units[$i];
 }
 
+function valid_required_text(string $value, int $maxLength = 160): bool
+{
+    return $value !== '' && mb_strlen($value) <= $maxLength;
+}
+
 // Endpoint para upload em chunks.
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'upload_chunk') {
     $nome = trim((string)($_POST['nome'] ?? ''));
     $email = trim((string)($_POST['email'] ?? ''));
+    $autor = trim((string)($_POST['autor'] ?? ''));
+    $coAutor1 = trim((string)($_POST['co_autor_1'] ?? ''));
+    $coAutor2 = trim((string)($_POST['co_autor_2'] ?? ''));
     $uploadId = preg_replace('/[^a-zA-Z0-9_-]/', '', (string)($_POST['upload_id'] ?? ''));
     $chunkIndex = (int)($_POST['chunk_index'] ?? -1);
     $totalChunks = (int)($_POST['total_chunks'] ?? 0);
@@ -156,11 +179,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
     $extension = get_file_extension($originalName);
     $totalSize = (int)($_POST['total_size'] ?? 0);
 
-    if ($nome === '' || mb_strlen($nome) > 160) {
+    if (!valid_required_text($nome)) {
         json_response(['ok' => false, 'message' => 'Informe um nome válido.'], 422);
     }
     if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         json_response(['ok' => false, 'message' => 'Informe um e-mail válido.'], 422);
+    }
+    if (!valid_required_text($autor)) {
+        json_response(['ok' => false, 'message' => 'Informe o autor.'], 422);
+    }
+    if (!valid_required_text($coAutor1)) {
+        json_response(['ok' => false, 'message' => 'Informe o co-autor 1.'], 422);
+    }
+    if (!valid_required_text($coAutor2)) {
+        json_response(['ok' => false, 'message' => 'Informe o co-autor 2.'], 422);
     }
     if ($totalSize <= 0 || $totalSize > MAX_BYTES) {
         json_response(['ok' => false, 'message' => 'O vídeo deve ter até ' . MAX_BYTES_LABEL . '.'], 422);
@@ -248,11 +280,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
         json_response(['ok' => false, 'message' => 'Envie somente arquivos de vídeo.'], 422);
     }
 
-    $stmt = $pdo->prepare('INSERT INTO envios (nome, email, arquivo_original, arquivo_salvo, tamanho, mime, criado_em)
-                           VALUES (:nome, :email, :arquivo_original, :arquivo_salvo, :tamanho, :mime, :criado_em)');
+    $stmt = $pdo->prepare('INSERT INTO envios (nome, email, autor, co_autor_1, co_autor_2, arquivo_original, arquivo_salvo, tamanho, mime, criado_em)
+                           VALUES (:nome, :email, :autor, :co_autor_1, :co_autor_2, :arquivo_original, :arquivo_salvo, :tamanho, :mime, :criado_em)');
     $stmt->execute([
         ':nome' => $nome,
         ':email' => $email,
+        ':autor' => $autor,
+        ':co_autor_1' => $coAutor1,
+        ':co_autor_2' => $coAutor2,
         ':arquivo_original' => $originalName,
         ':arquivo_salvo' => $savedName,
         ':tamanho' => $actualSize,
@@ -339,6 +374,39 @@ if (isset($_GET['download'])) {
     exit;
 }
 
+// Exportação CSV protegida.
+if (isset($_GET['export']) && $_GET['export'] === 'csv') {
+    require_admin();
+
+    $rows = $pdo->query('SELECT * FROM envios ORDER BY datetime(criado_em) DESC, id DESC')->fetchAll(PDO::FETCH_ASSOC);
+
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="envios_' . date('Y-m-d_H-i-s') . '.csv"');
+    header('X-Content-Type-Options: nosniff');
+
+    echo "\xEF\xBB\xBF";
+    $out = fopen('php://output', 'wb');
+    fputcsv($out, ['Data', 'Nome', 'E-mail', 'Autor', 'Co-autor 1', 'Co-autor 2', 'Arquivo', 'Tamanho', 'Tamanho em bytes', 'MIME'], ';');
+
+    foreach ($rows as $row) {
+        fputcsv($out, [
+            date('d/m/Y H:i', strtotime($row['criado_em'])),
+            $row['nome'],
+            $row['email'],
+            $row['autor'] ?? '',
+            $row['co_autor_1'] ?? '',
+            $row['co_autor_2'] ?? '',
+            $row['arquivo_original'],
+            bytes_to_human((int)$row['tamanho']),
+            (string)$row['tamanho'],
+            $row['mime'] ?? '',
+        ], ';');
+    }
+
+    fclose($out);
+    exit;
+}
+
 $isAdminPage = isset($_GET['admin']);
 $envios = [];
 if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
@@ -388,6 +456,8 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
             width: min(1120px, 100%);
             margin: 0 auto;
         }
+
+        .admin-shell { width: min(1500px, 100%); }
 
         .topbar {
             display: flex;
@@ -581,11 +651,28 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
 
         .admin-card { margin-top: 22px; }
 
+        .admin-heading {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 18px;
+            margin-bottom: 26px;
+        }
+
+        .admin-heading .subtitle { margin-bottom: 0; }
+
         .table-wrap { overflow-x: auto; }
         table {
             width: 100%;
             border-collapse: collapse;
-            min-width: 760px;
+            min-width: 1120px;
+        }
+
+        .admin-shell .table-wrap { overflow-x: visible; }
+        .admin-shell table {
+            min-width: 0;
+            table-layout: fixed;
+            font-size: .84rem;
         }
 
         th, td {
@@ -595,11 +682,21 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
             vertical-align: middle;
         }
 
+        .admin-shell th, .admin-shell td {
+            padding: 11px 9px;
+            word-break: break-word;
+        }
+
         th {
             color: #475569;
             font-size: .82rem;
             text-transform: uppercase;
             letter-spacing: .08em;
+        }
+
+        .admin-shell th {
+            font-size: .68rem;
+            letter-spacing: .05em;
         }
 
         td { color: #1f2937; }
@@ -616,11 +713,25 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
             white-space: nowrap;
         }
 
+        .admin-shell .pill {
+            padding: 5px 7px;
+            font-size: .74rem;
+        }
+
         .download {
             width: auto;
             padding: 10px 13px;
             border-radius: 14px;
             font-size: .9rem;
+        }
+
+        .export-csv {
+            width: auto;
+            flex: 0 0 auto;
+            padding: 11px 14px;
+            border-radius: 14px;
+            font-size: .92rem;
+            white-space: nowrap;
         }
 
         .actions {
@@ -629,6 +740,8 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
             gap: 8px;
             flex-wrap: wrap;
         }
+
+        .admin-shell .actions { gap: 6px; }
 
         .actions form { margin: 0; }
 
@@ -639,6 +752,13 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
             font-size: .9rem;
             background: linear-gradient(135deg, #ef4444, #b91c1c);
             box-shadow: 0 12px 26px rgba(220, 38, 38, .22);
+        }
+
+        .admin-shell .download,
+        .admin-shell .delete {
+            padding: 8px 9px;
+            border-radius: 12px;
+            font-size: .76rem;
         }
 
         .empty {
@@ -659,11 +779,15 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
             .hero { grid-template-columns: 1fr; }
             .copy { padding: 8px 0 0; }
             .topbar { align-items: flex-start; }
+            .admin-heading { display: block; }
+            .export-csv { width: 100%; margin-top: 16px; }
+            .admin-shell .table-wrap { overflow-x: auto; }
+            .admin-shell table { min-width: 980px; }
         }
     </style>
 </head>
 <body>
-<div class="shell">
+<div class="shell <?= $isAdminPage && !empty($_SESSION['admin_ok']) ? 'admin-shell' : '' ?>">
     <header class="topbar">
         <div class="brand">
             <div class="logo">▶</div>
@@ -696,6 +820,18 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
                         <div class="field">
                             <label for="email">E-mail</label>
                             <input id="email" name="email" type="email" required placeholder="ana@email.com">
+                        </div>
+                        <div class="field">
+                            <label for="autor">Autor</label>
+                            <input id="autor" name="autor" type="text" maxlength="160" required placeholder="Ex.: Ana Silva">
+                        </div>
+                        <div class="field">
+                            <label for="co_autor_1">Co-autor 1</label>
+                            <input id="co_autor_1" name="co_autor_1" type="text" maxlength="160" required placeholder="Ex.: Bruno Souza">
+                        </div>
+                        <div class="field">
+                            <label for="co_autor_2">Co-autor 2</label>
+                            <input id="co_autor_2" name="co_autor_2" type="text" maxlength="160" required placeholder="Ex.: Carla Mendes">
                         </div>
                         <div class="field dropzone">
                             <label for="video">Arquivo de vídeo</label>
@@ -739,8 +875,13 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
         <?php else: ?>
             <section class="card admin-card">
                 <div class="card-inner">
-                    <h2>Envios recebidos</h2>
-                    <p class="subtitle">Listagem em ordem de data, da mais recente para a mais antiga.</p>
+                    <div class="admin-heading">
+                        <div>
+                            <h2>Envios recebidos</h2>
+                            <p class="subtitle">Listagem em ordem de data, da mais recente para a mais antiga.</p>
+                        </div>
+                        <a class="button export-csv" href="?admin=1&export=csv">Exportar CSV</a>
+                    </div>
 
                     <?php if (!empty($_SESSION['flash_ok'])): ?>
                         <div class="status ok"><?= h($_SESSION['flash_ok']); unset($_SESSION['flash_ok']); ?></div>
@@ -754,11 +895,25 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
                     <?php else: ?>
                         <div class="table-wrap">
                             <table>
+                                <colgroup>
+                                    <col style="width: 13%;">
+                                    <col style="width: 9%;">
+                                    <col style="width: 14%;">
+                                    <col style="width: 9%;">
+                                    <col style="width: 9%;">
+                                    <col style="width: 9%;">
+                                    <col style="width: 16%;">
+                                    <col style="width: 8%;">
+                                    <col style="width: 13%;">
+                                </colgroup>
                                 <thead>
                                 <tr>
                                     <th>Data</th>
                                     <th>Nome</th>
                                     <th>E-mail</th>
+                                    <th>Autor</th>
+                                    <th>Co-autor 1</th>
+                                    <th>Co-autor 2</th>
                                     <th>Arquivo</th>
                                     <th>Tamanho</th>
                                     <th>Ações</th>
@@ -770,6 +925,9 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
                                         <td><span class="pill"><?= h(date('d/m/Y H:i', strtotime($envio['criado_em']))) ?></span></td>
                                         <td><?= h($envio['nome']) ?></td>
                                         <td><span class="muted"><?= h($envio['email']) ?></span></td>
+                                        <td><?= h($envio['autor'] ?? '') ?></td>
+                                        <td><?= h($envio['co_autor_1'] ?? '') ?></td>
+                                        <td><?= h($envio['co_autor_2'] ?? '') ?></td>
                                         <td><?= h($envio['arquivo_original']) ?></td>
                                         <td><?= h(bytes_to_human((int)$envio['tamanho'])) ?></td>
                                         <td>
@@ -821,10 +979,13 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
 
         const nome = document.getElementById('nome').value.trim();
         const email = document.getElementById('email').value.trim();
+        const autor = document.getElementById('autor').value.trim();
+        const coAutor1 = document.getElementById('co_autor_1').value.trim();
+        const coAutor2 = document.getElementById('co_autor_2').value.trim();
         const fileInput = document.getElementById('video');
         const file = fileInput.files[0];
 
-        if (!nome || !email || !file) {
+        if (!nome || !email || !autor || !coAutor1 || !coAutor2 || !file) {
             setStatus('Preencha todos os campos.', 'err');
             return;
         }
@@ -860,6 +1021,9 @@ if ($isAdminPage && !empty($_SESSION['admin_ok'])) {
                 data.append('action', 'upload_chunk');
                 data.append('nome', nome);
                 data.append('email', email);
+                data.append('autor', autor);
+                data.append('co_autor_1', coAutor1);
+                data.append('co_autor_2', coAutor2);
                 data.append('upload_id', uploadId);
                 data.append('chunk_index', String(i));
                 data.append('total_chunks', String(totalChunks));
